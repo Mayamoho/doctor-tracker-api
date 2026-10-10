@@ -31,6 +31,12 @@ npm run dev               # http://127.0.0.1:5000/api/v1
 | `npm run indexes` | `explain()` report for every path the UI takes |
 | `npm run typecheck` | `tsc --noEmit` |
 
+### Deploying
+
+This service goes on Render (build `npm ci && npm run build`, start `npm start`, health check path `/health`); the portal that rewrites to it goes on Vercel. `PORT` comes from the platform, and `COOKIE_SECURE` need not be set — it defaults to `true` under `NODE_ENV=production`. The Atlas Network Access entry is the step that blocks people, because a free Render service has dynamic egress IPs and cannot be allowlisted by address.
+
+Full procedure, including why the cookies stay host-only and what breaks if you add a `Domain`: [doctor-tracker-web ▸ Deployment](https://github.com/Mayamoho/doctor-tracker-web#deployment).
+
 ## Layout
 
 ```
