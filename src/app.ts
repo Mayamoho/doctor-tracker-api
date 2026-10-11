@@ -1,6 +1,6 @@
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
-import express from 'express';
+import express, { type Request, type Response } from 'express';
 import helmet from 'helmet';
 import { env } from './config/env';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
@@ -45,7 +45,12 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/', (_req, res) => {
+/**
+ * The same document answers `/` and the `/api/v1` base path. The resource router
+ * mounted below has no index of its own, so without this the most obvious URL to
+ * type — the API root — is a 404 while the real endpoints all work.
+ */
+function serviceIndex(_req: Request, res: Response): void {
   res.json({
     success: true,
     data: {
@@ -62,7 +67,10 @@ app.get('/', (_req, res) => {
       listParams: 'page, limit, search, sort, from, to — plus specialization/hospital for doctors and condition/doctorId/gender for patients',
     },
   });
-});
+}
+
+app.get('/', serviceIndex);
+app.get(['/api/v1', '/api/v1/'], serviceIndex);
 
 app.use('/api/v1', apiLimiter, routes);
 
