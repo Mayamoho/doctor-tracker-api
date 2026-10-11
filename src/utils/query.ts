@@ -4,7 +4,20 @@ export const objectIdSchema = z
   .string()
   .regex(/^[a-fA-F0-9]{24}$/, 'Must be a valid MongoDB ObjectId');
 
-export const dateParamSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD');
+/**
+ * `2026-13-45` passes a `\d{2}` shape check but is not a date, and V8 rolls an
+ * out-of-range day over instead of rejecting it — `2026-02-30` parses as 2 March.
+ * An invalid bound silently drops out of the range filter, so the caller would get
+ * an unfiltered 200 while believing the filter had worked. Round-tripping through
+ * UTC catches both.
+ */
+export const dateParamSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD')
+  .refine((value) => {
+    const parsed = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+  }, 'Not a real calendar date');
 
 /**
  * Browsers happily send `?search=&sort=` for untouched filters, and `""` coerces

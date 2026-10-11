@@ -20,8 +20,10 @@ const envSchema = z.object({
 
   ADMIN_NAME: z.string().default('Admin'),
   ADMIN_EMAIL: z.string().default('admin@doctortracker.dev'),
+  // The default exists so `npm run seed` works on a fresh clone. It is refused in
+  // production below, because the seed writes this password straight into the only
+  // admin account.
   ADMIN_PASSWORD: z.string().default('Admin@1234'),
-  SEED_DOCTORS: z.coerce.number().int().min(1).max(500).default(45),
   SEED_PATIENTS: z.coerce.number().int().min(1).max(20000).default(600),
 });
 
@@ -39,6 +41,13 @@ if (!parsed.success) {
 
 const raw = parsed.data;
 const isProduction = raw.NODE_ENV === 'production';
+
+// A deployed API that still accepts the shipped seed password is a public admin
+// login waiting to be guessed, so this is a hard failure rather than a warning.
+if (isProduction && raw.ADMIN_PASSWORD === 'Admin@1234') {
+  console.error('Refusing to start in production with the default ADMIN_PASSWORD.');
+  process.exit(1);
+}
 
 export const env = {
   ...raw,

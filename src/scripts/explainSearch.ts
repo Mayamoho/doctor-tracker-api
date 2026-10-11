@@ -1,6 +1,12 @@
 import mongoose from 'mongoose';
 import type { Db } from 'mongodb';
 import { connectDB, disconnectDB, syncIndexes } from '../config/db';
+// `syncIndexes` walks `mongoose.models`, so the schemas have to be registered
+// before it is called — without these the script silently reports on whatever the
+// last seed left behind instead of the index set defined in the models.
+import '../models/Doctor';
+import '../models/Patient';
+import '../models/User';
 import { escapeRegex } from '../utils/regex';
 import { searchTerm } from '../utils/search';
 
@@ -28,37 +34,50 @@ interface Verdict {
   millis: number;
 }
 
-/** `$or` fans out into parallel index scans under one root, so the tree is walked. */
-function walk(plan: unknown, stages: string[], indexes: string[]): void {
-  if (!plan || typeof plan !== 'object') return;
-  const node = plan as Doc;
-
-  if (typeof node.stage === 'string') stages.push(node.stage);
-  if (typeof node.indexName === 'string') indexes.push(node.indexName);
-
-  walk(node.inputStage, stages, indexes);
-  walk(node.thenStage, stages, indexes);
-  if (Array.isArray(node.inputStages)) node.inputStages.forEach((child) => walk(child, stages, indexes));
+/** First object under `key` anywhere in the tree — plan shapes differ per verb. */
+function deepFind(node: unknown, key: string): Doc | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = deepFind(child, key);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+  const direct = (node as Doc)[key];
+  if (direct && typeof direct === 'object') return direct as Doc;
+  for (const child of Object.values(node as Doc)) {
+    const hit = deepFind(child, key);
+    if (hit) return hit;
+  }
+  return undefined;
 }
 
-async function explain(
-  db: Db,
-  collection: string,
-  filter: Doc,
-  options: { sort?: Record<string, 1 | -1>; limit?: number } = {},
-): Promise<Verdict> {
-  let cursor = db.collection(collection).find(filter);
-  if (options.sort) cursor = cursor.sort(options.sort);
-  if (options.limit) cursor = cursor.limit(options.limit);
+/**
+ * Collects every `stage` / `indexName` in the plan tree.
+ *
+ * Deliberately shape-agnostic: `$or` fans out into parallel scans under one root,
+ * and an aggregation plan nests the cursor plan one level deeper than a `find()`
+ * plan does. Walking everything is shorter than tracking both layouts.
+ */
+function collect(node: unknown, stages: string[], indexes: string[]): void {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    node.forEach((child) => collect(child, stages, indexes));
+    return;
+  }
+  const doc = node as Doc;
+  if (typeof doc.stage === 'string') stages.push(doc.stage);
+  if (typeof doc.indexName === 'string') indexes.push(doc.indexName);
+  Object.values(doc).forEach((child) => collect(child, stages, indexes));
+}
 
-  const raw = (await cursor.explain('executionStats')) as unknown as Doc;
-  // `queryPlanner` and `executionStats` are siblings — the plan is not nested
-  // under `explain` in the MongoDB 8 output format.
+function toVerdict(raw: unknown): Verdict {
   const stages: string[] = [];
   const indexes: string[] = [];
-  walk((raw.queryPlanner as Doc | undefined)?.winningPlan, stages, indexes);
+  collect(deepFind(raw, 'winningPlan') ?? raw, stages, indexes);
 
-  const stats = (raw.executionStats ?? {}) as Doc;
+  const stats = deepFind(raw, 'executionStats') ?? {};
   return {
     stages,
     indexes,
@@ -69,14 +88,34 @@ async function explain(
   };
 }
 
+async function explainFind(
+  db: Db,
+  collection: string,
+  filter: Doc,
+  options: { sort?: Record<string, 1 | -1>; limit?: number } = {},
+): Promise<Verdict> {
+  let cursor = db.collection(collection).find(filter);
+  if (options.sort) cursor = cursor.sort(options.sort);
+  if (options.limit) cursor = cursor.limit(options.limit);
+  // `queryPlanner` and `executionStats` are siblings — the plan is not nested
+  // under `explain` in the MongoDB 8 output format.
+  return toVerdict(await cursor.explain('executionStats'));
+}
+
+/** The patient list is an aggregation, so it has to be explained as one. */
+async function explainPipeline(db: Db, collection: string, pipeline: Doc[]): Promise<Verdict> {
+  return toVerdict(await db.collection(collection).aggregate(pipeline).explain('executionStats'));
+}
+
 function report(label: string, verdict: Verdict): void {
   const scanned = verdict.stages.includes('COLLSCAN');
   const wholeIndex = verdict.stages.includes('IXSCAN') && verdict.keys > verdict.returned * 4;
-  const verdict$ = scanned ? 'COLLSCAN  ' : wholeIndex ? 'IXSCAN*   ' : 'IXSCAN    ';
+  const plan = scanned ? 'COLLSCAN  ' : wholeIndex ? 'IXSCAN*   ' : 'IXSCAN    ';
   const used = verdict.indexes.length > 0 ? [...new Set(verdict.indexes)].join(', ') : 'none';
+  const sorted = verdict.stages.includes('SORT') ? ' + blocking sort' : '';
 
   console.log(
-    `${verdict$} ${label}\n` +
+    `${plan} ${label}${sorted}\n` +
       `             index: ${used}\n` +
       `             keys=${verdict.keys} docs=${verdict.docs} returned=${verdict.returned} ${verdict.millis}ms\n`,
   );
@@ -95,43 +134,79 @@ async function main(): Promise<void> {
   // "Dr. Farhana Yeasmin Hossain" — which is the whole reason for `searchTerms`.
   const term = searchTerm(tokens.at(-1) ?? 'dr') ?? 'dr';
 
+  // Values are read from the seeded data rather than hardcoded, so a filter row
+  // can never quietly turn into "matches nothing" after the directory changes.
+  const specialization = (await db.collection('doctors').findOne({}, { projection: { specialization: 1 } }))
+    ?.specialization as string | undefined;
+  const gender = (await db.collection('patients').findOne({}, { projection: { gender: 1 } }))?.gender as
+    | string
+    | undefined;
+  const patientRow = await db.collection('patients').findOne({}, { projection: { doctorId: 1 } });
+
   console.log(`\nSearch term: "${term}"\n`);
 
   report(
     'doctor search — anchored prefix on normalized tokens',
-    await explain(db, 'doctors', { searchTerms: { $regex: `^${escapeRegex(term)}` } }, { limit: 10 }),
+    await explainFind(db, 'doctors', { searchTerms: { $regex: `^${escapeRegex(term)}` } }, { limit: 10 }),
   );
 
   report(
     'doctor search — same term unanchored (the usual first attempt)',
-    await explain(db, 'doctors', { searchTerms: { $regex: escapeRegex(term) } }, { limit: 10 }),
+    await explainFind(db, 'doctors', { searchTerms: { $regex: escapeRegex(term) } }, { limit: 10 }),
   );
 
   report(
     'doctor search — anchored with the i flag on `name`',
-    await explain(db, 'doctors', { name: { $regex: `^${escapeRegex(term)}`, $options: 'i' } }, { limit: 10 }),
+    await explainFind(db, 'doctors', { name: { $regex: `^${escapeRegex(term)}`, $options: 'i' } }, { limit: 10 }),
   );
 
-  const doctorRow = await db.collection('patients').findOne({}, { projection: { doctorId: 1 } });
-
   report(
-    'doctor list — specialization filter + default sort + page 1',
-    await explain(
+    'doctor search + newest-first page (the list endpoint)',
+    await explainFind(
       db,
       'doctors',
-      { specialization: 'Medicine' },
+      { searchTerms: { $regex: `^${escapeRegex(term)}` } },
       { sort: { createdAt: -1, _id: -1 }, limit: 10 },
     ),
   );
 
-  if (doctorRow?.doctorId) {
+  if (specialization) {
     report(
-      "patient list — one doctor, newest visit first",
-      await explain(
+      `doctor list — specialization "${specialization}" + default sort + page 1`,
+      await explainFind(
+        db,
+        'doctors',
+        { specialization },
+        { sort: { createdAt: -1, _id: -1 }, limit: 10 },
+      ),
+    );
+  }
+
+  report(
+    'doctor list — most experienced first',
+    await explainFind(db, 'doctors', {}, { sort: { experienceYears: -1, _id: -1 }, limit: 10 }),
+  );
+
+  if (patientRow?.doctorId) {
+    report(
+      'patient list — one doctor, newest visit first (aggregation as the service runs it)',
+      await explainPipeline(db, 'patients', [
+        { $match: { doctorId: patientRow.doctorId } },
+        { $sort: { visitDate: -1, _id: -1 } },
+        { $skip: 0 },
+        { $limit: 10 },
+      ]),
+    );
+  }
+
+  if (gender) {
+    report(
+      `patient list — gender "${gender}" filter + newest first`,
+      await explainFind(
         db,
         'patients',
-        { doctorId: doctorRow.doctorId },
-        { sort: { visitDate: -1, _id: -1 }, limit: 10 },
+        { gender },
+        { sort: { createdAt: -1, _id: -1 }, limit: 10 },
       ),
     );
   }
@@ -145,7 +220,17 @@ async function main(): Promise<void> {
 
   report(
     'patient list — date-wise range on visitDate',
-    await explain(db, 'patients', { visitDate: { $gte: monthStart(4), $lt: monthStart(0) } }, { limit: 10 }),
+    await explainFind(db, 'patients', { visitDate: { $gte: monthStart(4), $lt: monthStart(0) } }, { limit: 10 }),
+  );
+
+  report(
+    'patient search — condition typed into the box, newest first',
+    await explainFind(
+      db,
+      'patients',
+      { searchTerms: { $regex: `^${escapeRegex('hypertension')}` } },
+      { sort: { createdAt: -1, _id: -1 }, limit: 10 },
+    ),
   );
 
   await disconnectDB();

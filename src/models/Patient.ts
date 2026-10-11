@@ -58,6 +58,7 @@ patientSchema.pre('save', function syncSearchTerms() {
 
 patientSchema.index({ name: 1 });
 patientSchema.index({ condition: 1, createdAt: -1, _id: -1 });
+patientSchema.index({ gender: 1, createdAt: -1, _id: -1 });
 patientSchema.index({ severity: 1, createdAt: -1, _id: -1 });
 patientSchema.index({ visitDate: -1, _id: -1 });
 patientSchema.index({ createdAt: -1, _id: -1 });

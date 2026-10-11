@@ -72,4 +72,8 @@ doctorSchema.index({ hospital: 1, createdAt: -1, _id: -1 });
 // Default sort for the unfiltered list.
 doctorSchema.index({ createdAt: -1, _id: -1 });
 
+// "Most experienced" is the one column sort with no filter in front of it, and
+// every other index on this collection leads with a different key.
+doctorSchema.index({ experienceYears: -1, _id: -1 });
+
 export const Doctor = mongoose.model<IDoctor>('Doctor', doctorSchema);

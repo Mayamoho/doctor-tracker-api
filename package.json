@@ -13,6 +13,7 @@
     "start": "node dist/server.js",
     "seed": "tsx src/scripts/seed.ts",
     "seed:prod": "node dist/scripts/seed.js",
+    "rotate:admin": "tsx src/scripts/rotateAdminPassword.ts",
     "typecheck": "tsc --noEmit",
     "indexes": "tsx src/scripts/explainSearch.ts"
   },
