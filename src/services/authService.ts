@@ -44,9 +44,11 @@ export async function login(email: string, password: string) {
  * is left alone here — it only moves on logout.
  *
  * Rotating the version per refresh would make refresh tokens single-use, which
- * breaks the moment two tabs refresh at the same time. Bumping it at logout
- * instead gives genuine server-side revocation of every outstanding session
- * without that race.
+ * breaks the moment two tabs refresh at the same time. Bumping it at logout stops
+ * every outstanding refresh token from validating, without that race.
+ *
+ * It does not revoke access tokens: `requireAuth` verifies signature and expiry
+ * only, so one keeps working until its own expiry. Bounded, not immediate.
  */
 export async function refresh(refreshToken: string) {
   const payload = verifyRefreshToken(refreshToken);

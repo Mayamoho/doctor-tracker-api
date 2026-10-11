@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { connectDB, disconnectDB, syncIndexes } from '../config/db';
 import { DIRECTORY_DOCTORS, NOT_PUBLISHED, type DirectoryDoctor } from '../data/doctorDirectory';
 import {
@@ -291,10 +292,25 @@ function buildPatients(
 async function seed(): Promise<void> {
   await connectDB();
 
+  /**
+   * This script drops three collections. Pointing it at the wrong database is
+   * unrecoverable, and `MONGO_URI` is just a string in a `.env` file — so in
+   * production it also has to be told the name of the database it is about to
+   * erase, typed out. Development needs no such ceremony because the whole point
+   * there is to reset cheaply and often.
+   */
+  const database = mongoose.connection.name;
+  if (env.isProduction && env.SEED_CONFIRM_DB !== database) {
+    throw new Error(
+      `Refusing to drop collections in production. This would delete every document in ` +
+        `'${database}'. Re-run with SEED_CONFIRM_DB=${database} if that is really intended.`,
+    );
+  }
+
   // Dropped rather than emptied: collection options cannot be changed in place,
   // and a database seeded before the collation was removed would keep carrying
   // a collection-level ICU collation that makes every `$regex` a collection scan.
-  console.log('Dropping existing collections…');
+  console.log(`Dropping existing collections in '${database}'…`);
   await Promise.all([
     Patient.collection.drop().catch(() => undefined),
     Doctor.collection.drop().catch(() => undefined),

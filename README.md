@@ -27,7 +27,7 @@ npm run dev               # http://127.0.0.1:5000/api/v1
 | `npm run dev` | `tsx watch` |
 | `npm run build` | `tsc` → `dist/` |
 | `npm start` | `node dist/server.js` |
-| `npm run seed` | reset + reseed (dev only; it drops the database) |
+| `npm run seed` | reset + reseed — drops three collections, so production refuses to run it unless `SEED_CONFIRM_DB` names the connected database |
 | `npm run rotate:admin` | set a new admin password from `ADMIN_PASSWORD` without touching any other collection |
 | `npm run indexes` | `explain()` report for every list path, including the two queries this design rejects |
 | `npm run typecheck` | `tsc --noEmit` |
@@ -60,8 +60,8 @@ src/
 ## What is worth reading
 
 - **`utils/search.ts`** — search runs against a normalized `searchTerms` array with an anchored prefix match, not `$regex` over raw strings. `npm run indexes` prints why: the unanchored version of the same query reads 593 index keys and 72 documents to return four rows, and the case-insensitive anchored one reads the whole `name` index and returns nothing at all.
-- **`utils/cookies.ts`** — the session is a 15-minute access token and a 7-day refresh token, both in httpOnly `SameSite=Lax` cookies. No token is ever returned in a body or readable by JavaScript.
-- **`services/authService.ts`** — refresh does *not* rotate. Each user carries a `tokenVersion` that is embedded in both tokens and compared on every refresh; it moves only when the user logs out, which revokes every outstanding session at once. Per-refresh rotation would make refresh tokens single-use and break the first two tabs that expire together.
+- **`utils/cookies.ts`** — the session is a 15-minute access token and a 7-day refresh token, both in httpOnly `SameSite=Lax` cookies. No token is ever returned in a body or readable by JavaScript. The refresh cookie is path-scoped to `/api/v1/auth` so it rides on refresh calls only; a third cookie, `dt_s`, carries no credential at all — its single job is to be visible to the portal's route gate, which otherwise cannot see the refresh token and would log a live session out at the door the moment the access cookie aged out.
+- **`services/authService.ts`** — refresh does *not* rotate. Each user carries a `tokenVersion` that is embedded in the refresh token and compared on every refresh; it moves when the user logs out or the credential is rotated. Per-refresh rotation would make refresh tokens single-use and break the first two tabs that expire together. **The honest limit:** protected requests verify the access token's signature and expiry only — there is no per-request session lookup — so logout ends the session the moment the refresh token is rejected, but an access token that was already issued keeps working for the remainder of its 15 minutes. Revocation is bounded, not immediate.
 - **`utils/query.ts`** — every list route shares one parameter parser: `limit` capped at 100, sort tokens whitelisted against an enum, date bounds rejected unless they are real calendar days, and an `_id` tiebreaker appended so a page boundary can never repeat or drop a row.
 - **`services/doctorService.ts`** — a page of doctors gets its patient counts from one `$group`, not one query per row.
 - **`config/env.ts`** — an invalid environment exits at boot rather than starting with an undefined secret, and production refuses to start on the default `ADMIN_PASSWORD`.

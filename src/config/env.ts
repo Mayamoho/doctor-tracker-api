@@ -25,6 +25,9 @@ const envSchema = z.object({
   // admin account.
   ADMIN_PASSWORD: z.string().default('Admin@1234'),
   SEED_PATIENTS: z.coerce.number().int().min(1).max(20000).default(600),
+  // Must equal the connected database name before `seed.ts` will drop anything in
+  // production. Deliberately not defaulted: an empty string never matches.
+  SEED_CONFIRM_DB: z.string().default(''),
 });
 
 const parsed = envSchema.safeParse(process.env);
