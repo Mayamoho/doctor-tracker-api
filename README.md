@@ -16,7 +16,7 @@ Requires Node `>= 20.19` and a MongoDB deployment (Atlas URI or local).
 ```bash
 cp .env.example .env      # MONGO_URI + two distinct JWT secrets
 npm install
-npm run seed              # admin user + 45 doctors / 600 patients
+npm run seed              # admin user + 72 real doctors / 600 synthetic patients
 npm run dev               # http://127.0.0.1:5000/api/v1
 ```
 
@@ -28,7 +28,8 @@ npm run dev               # http://127.0.0.1:5000/api/v1
 | `npm run build` | `tsc` → `dist/` |
 | `npm start` | `node dist/server.js` |
 | `npm run seed` | reset + reseed (dev only; it drops the database) |
-| `npm run indexes` | `explain()` report for every path the UI takes |
+| `npm run rotate:admin` | set a new admin password from `ADMIN_PASSWORD` without touching any other collection |
+| `npm run indexes` | `explain()` report for every list path, including the two queries this design rejects |
 | `npm run typecheck` | `tsc --noEmit` |
 
 ### Deploying
@@ -50,18 +51,28 @@ src/
   controllers/           response shaping
   services/              queries, aggregations, pagination
   models/                Doctor · Patient · User
+  data/                  doctorDirectory.ts (sourced) · clinicalReference.ts (reference tables)
   middleware/            auth · validate · rateLimit · errorHandler
   utils/                 search tokens · cookies · tokens · pagination
-  scripts/               seed · explainSearch
+  scripts/               seed · explainSearch · rotateAdminPassword
 ```
 
 ## What is worth reading
 
-- **`utils/search.ts`** — search runs against a normalized `searchTerms` array with an anchored prefix match, not `$regex` over raw strings. `npm run indexes` prints why: the unanchored version of the same query reads 583 index keys and 45 documents to return two rows, and the case-insensitive anchored one returns nothing at all.
-- **`utils/cookies.ts`** — the session is a 15-minute access token and a 7-day rotating refresh token, both in httpOnly `SameSite=Lax` cookies. No token is ever returned in a body or readable by JavaScript.
-- **`utils/query.ts`** — every list route shares one parameter parser: `limit` capped at 100, sort tokens whitelisted against an enum, and an `_id` tiebreaker appended so a page boundary can never repeat or drop a row.
+- **`utils/search.ts`** — search runs against a normalized `searchTerms` array with an anchored prefix match, not `$regex` over raw strings. `npm run indexes` prints why: the unanchored version of the same query reads 593 index keys and 72 documents to return four rows, and the case-insensitive anchored one reads the whole `name` index and returns nothing at all.
+- **`utils/cookies.ts`** — the session is a 15-minute access token and a 7-day refresh token, both in httpOnly `SameSite=Lax` cookies. No token is ever returned in a body or readable by JavaScript.
+- **`services/authService.ts`** — refresh does *not* rotate. Each user carries a `tokenVersion` that is embedded in both tokens and compared on every refresh; it moves only when the user logs out, which revokes every outstanding session at once. Per-refresh rotation would make refresh tokens single-use and break the first two tabs that expire together.
+- **`utils/query.ts`** — every list route shares one parameter parser: `limit` capped at 100, sort tokens whitelisted against an enum, date bounds rejected unless they are real calendar days, and an `_id` tiebreaker appended so a page boundary can never repeat or drop a row.
 - **`services/doctorService.ts`** — a page of doctors gets its patient counts from one `$group`, not one query per row.
-- **`config/env.ts`** — an invalid environment exits at boot rather than starting with an undefined secret.
+- **`config/env.ts`** — an invalid environment exits at boot rather than starting with an undefined secret, and production refuses to start on the default `ADMIN_PASSWORD`.
+
+## Where the seed data comes from
+
+`npm run seed` writes two different kinds of row, and the difference is deliberate. [Provenance is written up in the portal README](https://github.com/Mayamoho/doctor-tracker-web#where-the-data-comes-from); the short version:
+
+- **72 doctors are real.** `data/doctorDirectory.ts` holds names, degrees, BMDC registration numbers, specialization and institution copied from public Bangladeshi doctor directories, with the source recorded per row. Their `phone` and `email` are the literal string `not published` — those numbers belong to real people and are not reprinted here, and inventing one against a real name would be worse than omitting it.
+- **600 patients are synthetic.** No lawful source of Bangladeshi patient records exists, so the identities are generated. Everything *around* them is reference data: district names and divisions from the DGHS facility registry, condition names with their ICD-10 codes, a per-specialty condition catalogue, and seasonal visit curves.
+- **`experienceYears` is an estimate**, derived from BMDC registration order (the register issues numbers sequentially, so a lower number is an earlier licence). It is the only doctor field that is not copied from a source.
 
 ## Security posture
 
@@ -79,10 +90,12 @@ src/
 MongoDB Atlas. Indexes are declared on the models and synchronised at boot, so a fresh database is query-optimized before the first request:
 
 ```
-searchTerms          doctor / patient free-text search
-specialization_1_createdAt_-1__id_-1    filter + sort + page in one scan
-doctorId_1_visitDate_-1__id_-1          one doctor's patients, newest first
-visitDate_-1__id_-1                     date-wise ranges
+searchTerms                              doctor / patient free-text search
+specialization_1_createdAt_-1__id_-1     filter + sort + page in one scan
+gender_1_createdAt_-1__id_-1             the patient gender filter
+experienceYears_-1__id_-1                "most experienced" without a collection scan
+doctorId_1_visitDate_-1__id_-1           one doctor's patients, newest first
+visitDate_-1__id_-1                      date-wise ranges
 ```
 
-Seeded data is synthetic: Bangladeshi names, districts and BMDC-style registration numbers. The seeded admin credentials in `.env.example` are development-only.
+The seeded admin credentials in `.env.example` are development-only, and `config/env.ts` refuses to boot a production process that still uses them.

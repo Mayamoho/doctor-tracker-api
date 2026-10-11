@@ -1,4 +1,13 @@
 import { connectDB, disconnectDB, syncIndexes } from '../config/db';
+import { DIRECTORY_DOCTORS, NOT_PUBLISHED, type DirectoryDoctor } from '../data/doctorDirectory';
+import {
+  CONDITIONS_BY_SPECIALTY,
+  DISTRICTS,
+  FALLBACK_CONDITIONS,
+  PROFILE_WEIGHTS,
+  type Condition,
+  type SeasonProfile,
+} from '../data/clinicalReference';
 import { Doctor, type IDoctor } from '../models/Doctor';
 import {
   BLOOD_GROUPS,
@@ -21,238 +30,38 @@ function weightedPick<T>(entries: readonly (readonly [T, number])[]): T {
     draw -= weight;
     if (draw <= 0) return value;
   }
-  return entries[0][0];
+  return entries.at(-1)![0];
 }
 
-type SeasonProfile = 'chronic' | 'monsoon' | 'winter' | 'summer';
+/** `A-101328` sorts after `A-26999` as a string, which is the opposite of the truth. */
+const registrationOrder = (bmdc: string) => Number(bmdc.replace(/^A-/, ''));
 
 /**
- * Specialty labels follow Bangladeshi medical directories ("Child", "Gynae & Obs",
- * "Chest & Asthma", "Diabetes & Hormone") rather than Western department names,
- * because that is the vocabulary the local registrations actually use.
+ * `experienceYears` is the one doctor field that is estimated rather than published.
  *
- * Each specialty carries its own qualification string and case mix, so the
- * dashboard's condition chart is coherent with the patients-per-doctor chart:
- * a paediatrician does not appear with cirrhotic adults.
+ * BMDC numbers are issued in registration order, so a lower number is an earlier
+ * licence — that is a property of the register, not an invention. Ranking the seeded
+ * set by number and mapping rank onto a career span keeps the figure internally
+ * consistent (a professor-grade `A-11606` never reads as a three-year junior) without
+ * claiming a number any directory printed. The README calls this out; every other
+ * field on a doctor comes straight from a source.
  */
-interface Specialty {
-  name: string;
-  degrees: readonly string[];
-  conditions: readonly string[];
-  age: readonly [number, number];
-  /** Gynaecology only ever sees female patients. */
-  femaleOnly?: boolean;
-  weight: number;
+function experienceBySeniority(sortedByReg: readonly DirectoryDoctor[]): Map<string, number> {
+  const out = new Map<string, number>();
+  const last = sortedByReg.length - 1;
+  sortedByReg.forEach((doctor, index) => {
+    const fraction = last === 0 ? 1 : index / last;
+    out.set(doctor.bmdc, Math.round(38 - fraction * 35));
+  });
+  return out;
 }
-
-const SPECIALTIES: readonly Specialty[] = [
-  {
-    name: 'Medicine',
-    degrees: ['MBBS, FCPS (Medicine)', 'MBBS (Dhaka), MD (Medicine)', 'MBBS, MCPS (Medicine)'],
-    conditions: ['Hypertension', 'Type 2 Diabetes', 'Dengue Fever', 'Typhoid', 'Gastroenteritis', 'Iron Deficiency Anemia'],
-    age: [18, 86],
-    weight: 16,
-  },
-  {
-    name: 'Cardiology',
-    degrees: ['MBBS, MD (Cardiology)', 'MBBS (Dhaka), FCPS (Cardiology)', 'MBBS, DCard (NICVD)'],
-    conditions: ['Ischemic Heart Disease', 'Hypertension', 'Atrial Fibrillation', 'Heart Failure', 'Dyslipidemia'],
-    age: [35, 88],
-    weight: 9,
-  },
-  {
-    name: 'Child',
-    degrees: ['MBBS, DCH', 'MBBS (Dhaka), FCPS (Pediatrics)', 'MBBS, MD (Pediatrics)'],
-    conditions: ['Acute Watery Diarrhea', 'Pneumonia', 'Measles', 'Acute Asthma', 'Malnutrition', 'Fever with Rash'],
-    age: [1, 14],
-    weight: 11,
-  },
-  {
-    name: 'Gynae & Obs',
-    degrees: ['MBBS, FCPS (Gynae & Obs)', 'MBBS (Dhaka), MS (Gynae)', 'MBBS, MCPS (Gynae)'],
-    conditions: ['Anemia in Pregnancy', 'PCOS', 'Menstrual Disorder', 'Ante-natal Check-up', 'Uterine Fibroid'],
-    age: [15, 55],
-    femaleOnly: true,
-    weight: 10,
-  },
-  {
-    name: 'Chest & Asthma',
-    degrees: ['MBBS, FCPS (Medicine)', 'MBBS, MD (Pulmonology)', 'MBBS (DU), Dip (TB & Chest)'],
-    conditions: ['Asthma', 'COPD', 'Tuberculosis', 'Chronic Bronchitis', 'Pleurisy'],
-    age: [12, 80],
-    weight: 7,
-  },
-  {
-    name: 'Diabetes & Hormone',
-    degrees: ['MBBS, MD (Endocrinology)', 'MBBS (Dhaka), FCPS (Medicine)', 'MBBS, DDV'],
-    conditions: ['Type 2 Diabetes', 'Type 1 Diabetes', 'Hypothyroidism', 'Dyslipidemia', 'Obesity'],
-    age: [14, 78],
-    weight: 7,
-  },
-  {
-    name: 'Neurology',
-    degrees: ['MBBS, MD (Neurology)', 'MBBS (Dhaka), FCPS (Neurology)'],
-    conditions: ['Migraine', 'Epilepsy', 'Post-Stroke Recovery', 'Cervical Spondylosis', 'Parkinsonism'],
-    age: [16, 82],
-    weight: 6,
-  },
-  {
-    name: 'Orthopedic',
-    degrees: ['MBBS, MS (Ortho)', 'MBBS (Dhaka), FCPS (Orthopedic)', 'MBBS, D. Orth'],
-    conditions: ['Osteoarthritis', 'Back Pain', 'Fracture Follow-up', 'Slipped Disc', 'Frozen Shoulder'],
-    age: [8, 85],
-    weight: 7,
-  },
-  {
-    name: 'Nephrology',
-    degrees: ['MBBS, MD (Nephrology)', 'MBBS (Dhaka), FCPS (Nephrology)'],
-    conditions: ['Chronic Kidney Disease', 'Urinary Tract Infection', 'Nephrotic Syndrome', 'Kidney Stone'],
-    age: [10, 80],
-    weight: 5,
-  },
-  {
-    name: 'Gastroenterology',
-    degrees: ['MBBS, MD (Gastroenterology)', 'MBBS (Dhaka), FCPS (Medicine)', 'MBBS, MRCP'],
-    conditions: ['Gastric Ulcer', 'Jaundice', 'Hepatitis B', 'Cirrhosis', 'GERD', 'Irritable Bowel'],
-    age: [16, 80],
-    weight: 6,
-  },
-  {
-    name: 'Eye',
-    degrees: ['MBBS, DO', 'MBBS (Dhaka), FCPS (Ophthalmology)', 'MBBS, MS (Eye)'],
-    conditions: ['Cataract', 'Glaucoma', 'Diabetic Retinopathy', 'Conjunctivitis', 'Refractive Error'],
-    age: [6, 88],
-    weight: 5,
-  },
-  {
-    name: 'ENT',
-    degrees: ['MBBS, DLO', 'MBBS (Dhaka), FCPS (ENT)'],
-    conditions: ['Chronic Sinusitis', 'Tonsillitis', 'Hearing Loss', 'Vertigo', 'Allergic Rhinitis'],
-    age: [5, 78],
-    weight: 4,
-  },
-  {
-    name: 'Dermatology & VD',
-    degrees: ['MBBS, DDV', 'MBBS (Dhaka), FCPS (Dermatology)'],
-    conditions: ['Fungal Infection', 'Scabies', 'Acne Vulgaris', 'Eczema', 'Psoriasis'],
-    age: [8, 70],
-    weight: 4,
-  },
-  {
-    name: 'Urology',
-    degrees: ['MBBS, MS (Urology)', 'MBBS (Dhaka), FCPS (Urology)'],
-    conditions: ['BPH', 'Kidney Stone', 'Urinary Tract Infection', 'Prostatitis'],
-    age: [25, 85],
-    weight: 4,
-  },
-  {
-    name: 'Psychiatry',
-    degrees: ['MBBS, MD (Psychiatry)', 'MBBS (Dhaka), FCPS (Psychiatry)'],
-    conditions: ['Depressive Disorder', 'Generalized Anxiety', 'Insomnia', 'Panic Disorder'],
-    age: [14, 68],
-    weight: 4,
-  },
-  {
-    name: 'Cancer',
-    degrees: ['MBBS, MD (Oncology)', 'MBBS (Dhaka), FCPS (Surgery)', 'MBBS, MRCP'],
-    conditions: ['Breast Cancer', 'Cervical Cancer', 'Lymphoma', 'Colorectal Cancer', 'Post-Chemo Review'],
-    age: [28, 82],
-    weight: 3,
-  },
-  {
-    name: 'General Surgery',
-    degrees: ['MBBS, MS (Surgery)', 'MBBS (Dhaka), FCPS (Surgery)'],
-    conditions: ['Hernia', 'Appendicitis Follow-up', 'Thyroid Nodule', 'Piles', 'Gall Stone'],
-    age: [15, 80],
-    weight: 5,
-  },
-  {
-    name: 'Laparoscopic Surgery',
-    degrees: ['MBBS, MS, FELCS', 'MBBS (Dhaka), FCPS (Surgery)', 'MBBS, D-Lap'],
-    conditions: ['Gall Stone', 'Appendicitis Follow-up', 'Hernia', 'Ovarian Cyst'],
-    age: [18, 72],
-    weight: 3,
-  },
-];
-
-/** Government and private facilities, each pinned to the district it actually sits in. */
-const FACILITIES: readonly { hospital: string; district: string; weight: number }[] = [
-  { hospital: 'Dhaka Medical College Hospital', district: 'Dhaka', weight: 8 },
-  { hospital: 'BSMMU (Pepsu)', district: 'Dhaka', weight: 7 },
-  { hospital: 'Square Hospital', district: 'Dhaka', weight: 6 },
-  { hospital: 'United Hospital', district: 'Dhaka', weight: 5 },
-  { hospital: 'Labaid Specialized Hospital', district: 'Dhaka', weight: 5 },
-  { hospital: 'Ibn Sina Common Health Care', district: 'Dhaka', weight: 5 },
-  { hospital: 'Popular Diagnostic Center', district: 'Dhaka', weight: 4 },
-  { hospital: 'Evercare Hospital Dhaka', district: 'Dhaka', weight: 3 },
-  { hospital: 'Bangladesh Specialized Hospital', district: 'Dhaka', weight: 3 },
-  { hospital: 'National Institute of Cardiovascular Diseases', district: 'Dhaka', weight: 3 },
-  { hospital: 'Mugda Medical College Hospital', district: 'Dhaka', weight: 3 },
-  { hospital: 'Chattogram Medical College Hospital', district: 'Chattogram', weight: 6 },
-  { hospital: 'Park Hospital', district: 'Chattogram', weight: 3 },
-  { hospital: 'Imperial Hospital', district: 'Chattogram', weight: 3 },
-  { hospital: 'MAA Ospitation', district: 'Chattogram', weight: 2 },
-  { hospital: 'Sylhet MAG Osmani Medical College Hospital', district: 'Sylhet', weight: 5 },
-  { hospital: 'Kea Women Medical College Hospital', district: 'Sylhet', weight: 2 },
-  { hospital: 'Rajshahi Medical College Hospital', district: 'Rajshahi', weight: 4 },
-  { hospital: 'Khulna Medical College Hospital', district: 'Khulna', weight: 3 },
-  { hospital: 'Sher-e-Bangla Medical College Hospital', district: 'Barishal', weight: 3 },
-  { hospital: 'Rangpur Medical College Hospital', district: 'Rangpur', weight: 3 },
-  { hospital: 'Cumilla Medical College Hospital', district: 'Cumilla', weight: 3 },
-  { hospital: 'Sheikh Mainur Rahman Medical College Hospital', district: 'Bogura', weight: 2 },
-  { hospital: 'Pabna Medical College Hospital', district: 'Pabna', weight: 2 },
-  { hospital: 'Mymensingh Medical College Hospital', district: 'Mymensingh', weight: 3 },
-  { hospital: 'Shaheed Suhrawardy Medical College Hospital', district: 'Dhaka', weight: 3 },
-];
 
 /**
- * Month weights, January first.
- *
- * Dengue and food-borne illness peak in the June–November monsoon; asthma, COPD
- * and pneumonia climb through the cool December–February months. Spreading every
- * condition evenly would make the 12-month area chart a flat line, which reads as
- * "the dashboard does not work".
+ * Patient identities are synthetic — see the note at the top of
+ * `data/clinicalReference.ts` for why they have to be. Given names and surnames are
+ * deliberately reused from small pools so no string here reads as one specific real
+ * person.
  */
-const PROFILE_WEIGHTS: Record<SeasonProfile, readonly number[]> = {
-  chronic: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-  monsoon: [0.2, 0.2, 0.3, 0.4, 0.7, 1.6, 2.6, 2.8, 2.4, 1.6, 0.7, 0.3],
-  winter: [2.6, 2.2, 1.2, 0.6, 0.5, 0.5, 0.6, 0.7, 1.0, 1.6, 2.4, 2.8],
-  summer: [0.3, 0.4, 0.8, 1.6, 2.2, 2.0, 1.4, 1.0, 0.9, 0.7, 0.4, 0.3],
-};
-
-const CONDITION_PROFILE: Record<string, SeasonProfile> = {
-  'Dengue Fever': 'monsoon',
-  Typhoid: 'monsoon',
-  Gastroenteritis: 'monsoon',
-  'Acute Watery Diarrhea': 'monsoon',
-  Measles: 'monsoon',
-  'Fever with Rash': 'monsoon',
-  Jaundice: 'monsoon',
-  'Urinary Tract Infection': 'monsoon',
-  Pneumonia: 'winter',
-  Asthma: 'winter',
-  'Acute Asthma': 'winter',
-  COPD: 'winter',
-  Tuberculosis: 'winter',
-  'Chronic Bronchitis': 'winter',
-  Pleurisy: 'winter',
-  'Allergic Rhinitis': 'winter',
-  Migraine: 'winter',
-  'Atrial Fibrillation': 'winter',
-  Cataract: 'summer',
-  Conjunctivitis: 'summer',
-  'Fungal Infection': 'summer',
-  Scabies: 'summer',
-  'Acne Vulgaris': 'summer',
-  'Kidney Stone': 'summer',
-};
-
-/** Senior consultants carry lower BMDC numbers, which is how the register reads. */
-function bmdcNumber(experienceYears: number): number {
-  const seniority = 58 - experienceYears;
-  return Math.floor(1200 + seniority * 820 + rand(0, 700));
-}
-
 const MALE_NAMES = [
   'Md. Abdul Karim', 'Md. Shahidul Islam', 'Rafiqul Islam', 'Nurul Amin', 'Mizanur Rahman',
   'Anwar Hossain', 'Habibur Rahman', 'Mahmudul Hasan', 'Sabbir Ahmed', 'Tanvir Mahmood',
@@ -275,46 +84,39 @@ const SURNAMES = [
   'Kabir', 'Anam', 'Siddique', 'Qureshi', 'Kamaruddin', 'Bepari', 'Nath', 'Das', 'Barman',
 ] as const;
 
-const DOCTOR_TITLES: readonly (readonly [string, number])[] = [
-  ['Dr.', 7],
-  ['Prof. Dr.', 2],
-  ['Assoc. Prof. Dr.', 2],
-] as const;
-
-const EMAIL_HOSTS: readonly (readonly [string, number])[] = [
-  ['gmail.com', 7],
-  ['yahoo.com', 2],
-  ['outlook.com', 1],
-] as const;
-
-/** O+ and B+ dominate; Rh-negative groups are genuinely rare in this population. */
+/**
+ * B+ and O+ lead and Rh-negative groups are rare, which is the shape Bangladeshi
+ * blood-bank series report. An approximation of that shape, not a measurement.
+ */
 const BLOOD_WEIGHTS: readonly (readonly [(typeof BLOOD_GROUPS)[number], number])[] = [
-  ['O+', 34],
-  ['B+', 30],
-  ['A+', 13],
-  ['O-', 8],
-  ['AB+', 6],
-  ['B-', 5],
-  ['A-', 3],
+  ['B+', 34],
+  ['O+', 32],
+  ['A+', 18],
+  ['AB+', 8],
+  ['O-', 3],
+  ['B-', 2],
+  ['A-', 2],
   ['AB-', 1],
 ] as const;
 
-const SEVERE_PRONE = new Set([
-  'Dengue Fever', 'Ischemic Heart Disease', 'Heart Failure', 'Chronic Kidney Disease',
-  'Pneumonia', 'COPD', 'Tuberculosis', 'Cirrhosis', 'Hepatitis B', 'Stroke',
-  'Post-Stroke Recovery', 'Breast Cancer', 'Cervical Cancer', 'Lymphoma',
-  'Colorectal Cancer', 'Nephrotic Syndrome', 'Malnutrition', 'Measles',
-]);
+const ADVICE = [
+  'Referred from the upazila health complex; advised to continue medication.',
+  'After meal. Follow up after 2 weeks with a fresh lab report.',
+  'Awaiting ultrasound report before the next consultation.',
+  'Regular review, condition stable. Next visit in one month.',
+  'Second opinion requested by family.',
+  'Advised diet and lifestyle changes along with the prescription.',
+  'Brought the previous prescription sheet. Dose adjusted.',
+  'Advised to return immediately if fever runs past three days.',
+] as const;
 
+/** Patient numbers are invented, but they have to be dial-shaped or the phone search demo is meaningless. */
 const mobile = () => `+8801${rand(3, 9)}${String(rand(0, 99999999)).padStart(8, '0')}`;
 
-const slug = (value: string) =>
-  value
-    .toLowerCase()
-    .replace(/[^a-z]+/g, '.')
-    .replace(/^\.|\.$/g, '');
-
-/** OPD sessions run roughly 08:00–20:00, so visit hours are drawn from that window. */
+/**
+ * OPD sessions run roughly 08:00–20:00, so visit hours come from that window and the
+ * month comes from the condition's own seasonality curve.
+ */
 function seasonalDate(profile: SeasonProfile): Date {
   const now = new Date();
   const weights = PROFILE_WEIGHTS[profile];
@@ -352,60 +154,72 @@ function recentDate(): Date {
   return new Date(Date.now() - daysAgo * 86_400_000 - rand(0, 86_399) * 1000);
 }
 
-const severityFor = (condition: string): Severity =>
+const severityFor = (condition: Condition): Severity =>
   weightedPick(
-    SEVERE_PRONE.has(condition)
+    condition.severeProne
       ? ([['mild', 2], ['moderate', 4], ['severe', 4]] as const)
       : ([['mild', 6], ['moderate', 3], ['severe', 1]] as const),
   );
 
-function buildDoctors(count: number): Omit<IDoctor, '_id'>[] {
-  const seenNames = new Set<string>();
-  const seenBmdc = new Set<string>();
-  const doctors: Omit<IDoctor, '_id'>[] = [];
+/**
+ * The patient's home district, weighted so most people are seen near where they live:
+ * the doctor's own district two thirds of the time, another district in the same
+ * division for most of the rest. A Dhaka consultant with a Bandarban patient every
+ * other row does not read as a real OPD list.
+ */
+function homeDistrict(doctorDistrict: string): string {
+  const division = DISTRICTS.find((d) => d.name === doctorDistrict)?.division;
+  const sameDivision = DISTRICTS.filter((d) => d.division === division);
+  if (division && Math.random() < 0.66 && sameDivision.some((d) => d.name === doctorDistrict)) {
+    return doctorDistrict;
+  }
+  if (division && sameDivision.length > 1) {
+    return weightedPick(sameDivision.map((d) => [d.name, d.weight] as const));
+  }
+  return weightedPick(DISTRICTS.map((d) => [d.name, d.weight] as const));
+}
 
-  while (doctors.length < count) {
-    const specialty = weightedPick(SPECIALTIES.map((item) => [item, item.weight] as const));
-    const facility = weightedPick(FACILITIES.map((item) => [item, item.weight] as const));
+/**
+ * Contacts are the one thing deliberately not carried over from the directories. Both
+ * sites publish chamber and personal numbers for these doctors; re-listing them on a
+ * demo register would route cold calls at real people, and substituting invented ones
+ * would put false contact data under real names. `not published` is stored instead and
+ * rendered as a plain label.
+ */
+function buildDoctors(): Omit<IDoctor, '_id'>[] {
+  const experience = experienceBySeniority(
+    [...DIRECTORY_DOCTORS].sort((a, b) => registrationOrder(a.bmdc) - registrationOrder(b.bmdc)),
+  );
 
-    const given = Math.random() < 0.55 ? pick(MALE_NAMES) : pick(FEMALE_NAMES);
-    const surname = pick(SURNAMES);
-    const name = `${weightedPick(DOCTOR_TITLES)} ${given} ${surname}`;
-    if (seenNames.has(name)) continue;
-    seenNames.add(name);
-
-    const experienceYears = rand(2, 40);
-    const reg = Math.random() < 0.75 ? `A-${bmdcNumber(experienceYears)}` : String(bmdcNumber(experienceYears));
-    if (seenBmdc.has(reg)) continue;
-    seenBmdc.add(reg);
-
-    // Derived from the doctor's own name, so the address and the record agree.
-    const givenToken = given.split(' ').at(-1) ?? given;
-    const email = `${slug(givenToken)}${slug(surname)}${rand(10, 99)}@${weightedPick(EMAIL_HOSTS)}`;
-    const phone = mobile();
+  return DIRECTORY_DOCTORS.map((doctor) => {
     const createdAt = recentDate();
-    doctors.push({
-      phone,
-      name,
-      specialization: specialty.name,
-      hospital: facility.hospital,
-      district: facility.district,
-      email,
-      degrees: pick(specialty.degrees),
-      bmdcRegistration: reg,
-      experienceYears,
-      searchTerms: doctorSearchTerms({ name, email, bmdcRegistration: reg, phone }),
+    return {
+      name: doctor.name,
+      specialization: doctor.specialization,
+      hospital: doctor.hospital,
+      district: doctor.district,
+      phone: NOT_PUBLISHED,
+      email: NOT_PUBLISHED,
+      degrees: doctor.degrees,
+      bmdcRegistration: doctor.bmdc,
+      experienceYears: experience.get(doctor.bmdc) ?? rand(2, 38),
+      // Withheld fields stay out of the token array on purpose: indexing the words
+      // "not published" would make every record match a search for "published".
+      searchTerms: doctorSearchTerms({
+        name: doctor.name,
+        email: '',
+        bmdcRegistration: doctor.bmdc,
+        phone: '',
+      }),
       createdAt,
       updatedAt: createdAt,
-    });
-  }
-
-  return doctors;
+    };
+  });
 }
 
 function buildPatients(
   count: number,
-  doctors: { _id: unknown; specialization: string }[],
+  doctors: { _id: unknown; specialization: string; district: string }[],
 ): Omit<IPatient, '_id'>[] {
   const grouped = new Map<string, typeof doctors>();
   for (const doctor of doctors) {
@@ -422,46 +236,50 @@ function buildPatients(
     // a flat distribution would make the patients-per-doctor bar chart useless.
     const pool = pick(pools);
     const doctor = pool[Math.floor(Math.pow(Math.random(), 1.7) * pool.length)] ?? pool[0];
-    const specialty =
-      SPECIALTIES.find((item) => item.name === doctor.specialization) ?? SPECIALTIES[0];
 
-    const condition = pick(specialty.conditions);
-    const profile = CONDITION_PROFILE[condition] ?? 'chronic';
-    const visitDate = seasonalDate(profile);
+    const catalogue = CONDITIONS_BY_SPECIALTY[doctor.specialization] ?? FALLBACK_CONDITIONS;
+    const condition = weightedPick(catalogue.map((item) => [item, item.weight] as const));
+    const visitDate = seasonalDate(condition.profile);
 
-    const gender: Gender = specialty.femaleOnly
+    const gender: Gender = condition.femaleOnly
       ? 'female'
-      : Math.random() < 0.5
+      : condition.maleOnly
         ? 'male'
-        : Math.random() < 0.98
-          ? 'female'
-          : 'other';
+        : Math.random() < 0.5
+          ? 'male'
+          : Math.random() < 0.98
+            ? 'female'
+            : 'other';
 
-    const patientName = `${gender === 'male' ? pick(MALE_NAMES) : pick(FEMALE_NAMES)} ${pick(SURNAMES)}`;
+    const given = gender === 'male' ? pick(MALE_NAMES) : pick(FEMALE_NAMES);
+    const surname = pick(SURNAMES);
+    // Most pool entries already carry a family name, so a second one on top reads as
+    // machine-made ("Kamrul Islam Islam"). Half the rows keep the name as-is.
+    const patientName =
+      Math.random() < 0.5 || given.toLowerCase().split(' ').includes(surname.toLowerCase())
+        ? given
+        : `${given} ${surname}`;
     const phone = mobile();
+
+    // The ICD-10 code and the home district go in `notes`: that is what an OPD card
+    // actually carries, and it makes a synthetic record auditable rather than opaque.
+    const notes =
+      Math.random() < 0.8
+        ? `ICD-10 ${condition.icd10}. From ${homeDistrict(doctor.district)}. ${pick(ADVICE)}`
+        : undefined;
 
     patients.push({
       name: patientName,
-      age: rand(specialty.age[0], specialty.age[1]),
+      age: rand(condition.age[0], condition.age[1]),
       gender,
       bloodGroup: weightedPick(BLOOD_WEIGHTS),
-      condition,
+      condition: condition.name,
       severity: severityFor(condition),
       phone,
       doctorId: doctor._id as IPatient['doctorId'],
       visitDate,
-      searchTerms: patientSearchTerms({ name: patientName, condition, phone }),
-      notes:
-        Math.random() < 0.35
-          ? pick([
-              'Referred from upazila health complex; advised to continue medication.',
-              'After meal. Follow up after 2 weeks with fresh lab report.',
-              'Awaiting ultrasound report before next consultation.',
-              'Regular review, condition stable. Next visit in one month.',
-              'Second opinion requested by family.',
-              'Advised diet and lifestyle changes along with prescription.',
-            ])
-          : undefined,
+      searchTerms: patientSearchTerms({ name: patientName, condition: condition.name, phone }),
+      notes,
       createdAt: visitDate,
       updatedAt: visitDate,
     });
@@ -484,16 +302,17 @@ async function seed(): Promise<void> {
   ]);
 
   // Indexes go on the empty collections first, so a duplicate BMDC number in the
-  // generated data fails at insert time with E11000 instead of as an index-build
+  // directory data fails at insert time with E11000 instead of as an index-build
   // error after everything has already been written.
   await syncIndexes();
 
   // `insertMany` skips middleware, so both token arrays are built inside the
   // generators instead of by the model's pre-save hook.
-  await Doctor.insertMany(buildDoctors(env.SEED_DOCTORS), { timestamps: false });
+  const doctors = buildDoctors();
+  await Doctor.insertMany(doctors, { timestamps: false });
 
-  const doctors = await Doctor.find({}, { _id: 1, specialization: 1 }).lean();
-  await Patient.insertMany(buildPatients(env.SEED_PATIENTS, doctors), { timestamps: false });
+  const inserted = await Doctor.find({}, { _id: 1, specialization: 1, district: 1 }).lean();
+  await Patient.insertMany(buildPatients(env.SEED_PATIENTS, inserted), { timestamps: false });
 
   const passwordHash = await hashPassword(env.ADMIN_PASSWORD);
   await User.create({
@@ -509,18 +328,17 @@ async function seed(): Promise<void> {
     Patient.countDocuments(),
   ]);
 
+  const specializations = new Set(doctors.map((doctor) => doctor.specialization));
   console.log(
-    `\nSeeded ${doctorCount} doctors and ${patientCount} patients.\n` +
-      `Sign in with ${env.ADMIN_EMAIL} / ${env.ADMIN_PASSWORD}\n`,
+    `\nSeeded ${doctorCount} real doctors across ${specializations.size} specialties and ` +
+      `${patientCount} synthetic patients.\n` +
+      `Sign in with ${env.ADMIN_EMAIL}.\n`,
   );
-
   await disconnectDB();
 }
 
-seed()
-  .then(() => process.exit(0))
-  .catch(async (error: unknown) => {
-    console.error('Seed failed:', error instanceof Error ? error.message : error);
-    await disconnectDB().catch(() => undefined);
-    process.exit(1);
-  });
+seed().catch(async (error: unknown) => {
+  console.error(error);
+  await disconnectDB().catch(() => undefined);
+  process.exitCode = 1;
+});

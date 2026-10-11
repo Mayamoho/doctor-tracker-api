@@ -41,6 +41,9 @@ export function searchTerm(input: string): string | null {
  */
 export function phoneVariants(phone: string): string[] {
   const digits = phone.replace(/\D/g, '');
+  // A withheld contact has no digits at all. Without this guard the `0` prefix below
+  // survives the empty-string filter and every such record becomes findable by "0".
+  if (!digits) return [];
   const withoutCountry = digits.startsWith('880') ? digits.slice(3) : digits.replace(/^0/, '');
   return [...new Set([digits, `0${withoutCountry}`, withoutCountry])].filter(Boolean);
 }
@@ -60,7 +63,9 @@ export function doctorSearchTerms(input: {
   const bmdc = input.bmdcRegistration.toLowerCase();
   const terms = [
     ...tokenize(input.name),
-    ...tokenize(input.email),
+    // A withheld contact is prose, not an address. Tokenizing the string
+    // `not published` would make every directory-sourced doctor match "published".
+    ...tokenize(input.email.includes('@') ? input.email : ''),
     ...tokenize(bmdc),
     bmdc.replace(/[^a-z0-9]+/g, ''),
     ...phoneVariants(input.phone),
