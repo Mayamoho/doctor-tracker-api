@@ -1,6 +1,6 @@
 # Doctor Tracker API
 
-Express 5 + Mongoose 9 REST API behind the [Doctor Tracker portal](https://github.com/Mayamoho/doctor-tracker-web) — the full technical write-up (architecture, data flow, the two deep dives, screenshots) lives in that repository's README.
+Express 5 + Mongoose 9 REST API behind the [Doctor Tracker portal](https://github.com/Mayamoho/doctor-tracker-web) — the full technical write-up (architecture, data flow, the two deep dives, screenshots) lives in that repository's README, along with the live URL and the reviewer sign-in.
 
 ```
 POST   /api/v1/auth/login          httpOnly access + refresh cookies
