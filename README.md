@@ -33,7 +33,9 @@ npm run dev               # http://127.0.0.1:5000/api/v1
 
 ### Deploying
 
-This service goes on Render (build `npm ci && npm run build`, start `npm start`, health check path `/health`); the portal that rewrites to it goes on Vercel. `PORT` comes from the platform, and `COOKIE_SECURE` need not be set — it defaults to `true` under `NODE_ENV=production`. The Atlas Network Access entry is the step that blocks people, because a free Render service has dynamic egress IPs and cannot be allowlisted by address.
+This service goes on Render (build `npm ci --include=dev && npm run build`, start `npm start`, health check path `/health`); the portal that rewrites to it goes on Vercel. `PORT` comes from the platform, and `COOKIE_SECURE` need not be set — it defaults to `true` under `NODE_ENV=production`.
+
+Two things that bite here. Render exports `NODE_ENV=production`, which makes npm set `omit=dev`, so a plain `npm ci` installs no devDependencies — `typescript` is one of them, and `npm run build` then fails at `tsc: not found`. Hence `--include=dev`. And Atlas Network Access must accept the service's egress address, which on the free tier is dynamic, so it cannot be allowlisted by IP.
 
 Full procedure, including why the cookies stay host-only and what breaks if you add a `Domain`: [doctor-tracker-web ▸ Deployment](https://github.com/Mayamoho/doctor-tracker-web#deployment).
 
