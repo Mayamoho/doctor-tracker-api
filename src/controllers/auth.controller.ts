@@ -12,13 +12,26 @@ export async function login(req: Request, res: Response): Promise<void> {
   res.json({ success: true, data: { user } });
 }
 
+/**
+ * A rejected refresh ends the session, so the cookies that describe it are cleared
+ * here rather than left to age out. `dt_s` deliberately outlives the access token —
+ * it lives as long as the refresh token, so the route gate can see a session the
+ * client can still renew — which means a stale one would keep bouncing `/login`
+ * back to `/dashboard`, leaving the visitor on an empty page with no way to the
+ * sign-in form.
+ */
 export async function refresh(req: Request, res: Response): Promise<void> {
-  const token = req.cookies?.[REFRESH_COOKIE];
-  if (!token) throw ApiError.unauthorized('Missing refresh token');
+  try {
+    const token = req.cookies?.[REFRESH_COOKIE];
+    if (!token) throw ApiError.unauthorized('Missing refresh token');
 
-  const { user, tokens } = await authService.refresh(token);
-  setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
-  res.json({ success: true, data: { user } });
+    const { user, tokens } = await authService.refresh(token);
+    setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
+    res.json({ success: true, data: { user } });
+  } catch (error) {
+    clearAuthCookies(res);
+    throw error;
+  }
 }
 
 /**
